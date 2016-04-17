@@ -1,0 +1,361 @@
+#!/bin/sh
+
+PREDICATES="predicates0.tvp"
+ACTIONS="actions0.tvp"
+
+SEMANTICS="$1"
+
+shift
+for def in $@
+do
+    source ./$def
+done
+
+
+default() {
+#{{{
+cat > $PREDICATES <<EOF
+foreach (p in Variables) {
+    %p p(v) unique pointer $VARIABLE__PROPERTIES
+}
+
+foreach (f in Fields+Selectors) {
+    %p f(v0, v1) function $FUNCTION__PROPERTIES
+}
+
+/*
+foreach (p in Arrays-Fields) {
+    %p p(v) pointer
+}
+
+foreach (f in Arrays-Variables) {
+    %p f(v0, v1)
+}
+*/
+
+foreach (t in Types+Data+Constructors) {
+    %p t(v0) $TYPES__PROPERTIES
+}
+foreach (p in ReturnSites) {
+    %p ret[p]()
+}
+EOF
+#}}}
+#{{{
+cat > $ACTIONS <<EOF
+%action skip() {
+    %t "skip"
+}
+
+%action true() {
+    %t "true"
+}
+
+%action false() {
+    %t "false"
+    %p 0
+}
+
+%action clear(lhs) {
+    %t lhs + " = NULL"
+    {
+        lhs(v) = 0
+        $UPDATE__CLEAR
+    }
+}
+
+%action copy(lhs, rhs) {
+    %t lhs + " = " + rhs
+    %f { rhs(v) $FOCUS__COPY }
+    $PRECOND__COPY
+    %message (E(v0) lhs(v0)) ->
+             "In copy: Assigning to non-NULL variable: " + lhs
+    $MESSAGE__COPY
+    {
+        lhs(v) = rhs(v)
+        $UPDATE__COPY
+    }
+}
+
+%action copy_as(lhs, rhs, type) {
+    %t lhs + " = (" + type + ")" + rhs
+    %f { rhs(v), rhs(v)& type(v), rhs(v) & !type(v) $FOCUS__COPY_AS }
+    $PRECOND__COPY_AS
+    %message (E(v0) rhs(v0) & !type(v0)) ->
+             "In copy: invalid cast of: " + lhs + " to: " + type
+    %message (E(v0) lhs(v0)) ->
+             "In copy: Assigning to non-NULL variable: " + lhs
+    $MESSAGE__COPY_AS
+    {
+        lhs(v) = rhs(v)
+        $UPDATE__COPY_AS
+    }
+}
+
+%action get_field(lhs, rhs, f) {
+    %t lhs + " = " + rhs + "." + f
+    %f { E(v0, v1) rhs(v0) & f(v0, v1) $FOCUS__GET_FIELD }
+    $PRECOND__GET_FIELD
+    %message !(E(v) rhs(v)) ->
+             "In get_field: NULL dereference: " + rhs + "." + f
+    %message (E(v0) lhs(v0)) ->
+             "In get_field: Assigning to non-NULL variable: " + lhs
+    $MESSAGE__GET_FIELD
+    {
+        lhs(v) = E(v0) rhs(v0) & f(v0, v)
+        $UPDATE__GET_FIELD
+    }
+}
+
+%action get_field_inverse(lhs, rhs, f) {
+    %t lhs + " = " + rhs + "." + f + "^-1"
+    %f { E(v0, v1) rhs(v1) & f(v0, v1) $FOCUS__GET_FIELD_INVERSE }
+    $PRECOND__GET_FIELD_INVERSE
+    %message !(E(v) rhs(v)) ->
+             "In get_field_inverse: NULL dereference: " + rhs + "." + f + "^-1"
+    %message (E(v0) lhs(v0)) ->
+             "In get_field_inverse: Assigning to non-NULL variable: " + lhs
+    $MESSAGE__GET_FIELD_INVERSE
+    {
+        lhs(v) = E(v0) rhs(v0) & f(v, v0)
+        $UPDATE__GET_FIELD_INVERSE
+    }
+}
+
+%action clear_field(lhs, f) {
+    %t lhs + "." + f + " = NULL"
+    %f { lhs(v), E(v0, v1) lhs(v0) & f(v0, v1) $FOCUS__CLEAR_FIELD }
+    %message !(E(v) lhs(v)) ->
+             "In clear_field: NULL dereference: " + lhs + "." + f
+    $MESSAGE__CLEAR_FIELD
+    {
+        f(v0, v1) = f(v0, v1) & !lhs(v0)
+        $UPDATE__CLEAR_FIELD
+    }
+}
+
+%action set_field_null(lhs, f, rhs) {
+    %t lhs + "." + f + " ?= NULL"
+    %f { lhs(v), rhs(v), E(v0, v1) lhs(v0) & f(v0, v1) $FOCUS__CLEAR_FIELD }
+    %p !(E(v) rhs(v)) $PRECOND__CLEAR_FIELD
+    %message !(E(v) lhs(v)) ->
+             "In set_field_null: NULL dereference: " + lhs + "." + f
+    $MESSAGE__CLEAR_FIELD
+    {
+        f(v0, v1) = f(v0, v1) & !lhs(v0)
+        $UPDATE__CLEAR_FIELD
+    }
+}
+
+%action set_field_nonnull(lhs, f, rhs) {
+    %t lhs + "." + f + " ?= " + rhs
+    %f { lhs(v), rhs(v) $FOCUS__SET_FIELD }
+    %p E(v) rhs(v) $PRECOND__SET_FIELD
+    %message (E(v0, v1) lhs(v0) & f(v0, v1)) ->
+             "In set_field_nonnull: Assigning to non-NULL field: " + lhs + "." + f
+    $MESSAGE__SET_FIELD
+    {
+        f(v0, v1) = f(v0, v1) | lhs(v0) & rhs(v1)
+        $UPDATE__SET_FIELD
+    }
+}
+
+%action clear_field_null(lhs, f) {
+    %t lhs + "." + f + " already NULL"
+    %f { lhs(v), E(v0, v1) lhs(v0) & f(v0, v1) }
+    %p !(E(v0, v1) lhs(v0) & f(v0, v1))
+    %message !(E(v) lhs(v)) ->
+             "In clear_field: NULL dereference: " + lhs + "." + f
+    $MESSAGE__CLEAR_FIELD
+    {
+    }
+}
+
+%action clear_field_nonnull(lhs, f) {
+    %t lhs + "." + f + " = NULL"
+    %f { lhs(v), E(v0, v1) lhs(v0) & f(v0, v1) $FOCUS__CLEAR_FIELD }
+    %p E(v0, v1) lhs(v0) & f(v0, v1) $PRECOND__CLEAR_FIELD
+    %message !(E(v) lhs(v)) ->
+             "In clear_field: NULL dereference: " + lhs + "." + f
+    $MESSAGE__CLEAR_FIELD
+    {
+        f(v0, v1) = f(v0, v1) & !lhs(v0)
+        $UPDATE__CLEAR_FIELD
+    }
+}
+
+%action mark(lhs, pred) {
+    %t "mark " + lhs + " "+ pred
+    %f { lhs(v), pred(v) $FOCUS__MARK }
+    $PRECOND__MARK
+    $MESSAGE__MARK
+    {
+        pred(v) = pred(v) | lhs(v)
+        $UPDATE__MARK
+    }
+}
+
+%action unmark(lhs, pred) {
+    %t "unmark " + lhs + " "+ pred
+    %f { lhs(v), pred(v) $FOCUS__UNMARK }
+    $PRECOND__UNMARK
+    $MESSAGE__UNMARK
+    {
+        pred(v) = pred(v) & !lhs(v)
+        $UPDATE__UNMARK
+    }
+}
+
+%action is_not_null(lhs) {
+    %t lhs + " != NULL"
+    %f { lhs(v) }
+    %p E(v) lhs(v)
+}
+
+%action is_null(lhs) {
+    %t lhs + " == NULL"
+    %f { lhs(v) }
+    %p !(E(v) lhs(v))
+}
+
+%action is_equal(lhs, rhs) {
+    %t lhs + " == " + rhs
+    %f { lhs(v), rhs(v) }
+    %p A(v) lhs(v) <-> rhs(v)
+}
+
+%action is_not_equal(lhs, rhs) {
+    %t lhs + " != " + rhs
+    %f { lhs(v), rhs(v) }
+    %p !A(v) lhs(v) <-> rhs(v)
+}
+
+%action is_marked(lhs, pred) {
+    %t lhs + " marked " + pred
+    %f { lhs(v) & pred(v), lhs(v) & !pred(v) }
+    %p E(v) lhs(v) & pred(v)
+}
+
+%action is_not_marked(lhs, pred) {
+    %t lhs + " not marked " + pred
+    %f { lhs(v) & pred(v), lhs(v) & !pred(v) }
+    %p !(E(v) lhs(v) & pred(v))
+}
+
+%action is_rel(lhs, pred, rhs) {
+    %t lhs + " " + pred + " " + rhs
+    %f { lhs(v), rhs(v), E(v1, v2) lhs(v1) & rhs(v2) & pred(v1, v2) }
+    %p A(v0, v1) (lhs(v0) & rhs(v1)) -> pred(v0, v1)
+}
+
+%action is_not_rel(lhs, pred, rhs) {
+    %t "not " + lhs + " " + pred + " " + rhs
+    %f { lhs(v), rhs(v), E(v1, v2) lhs(v1) & rhs(v2) & pred(v1, v2) }
+    %p !(E(v0, v1) lhs(v0) & rhs(v1) & pred(v0, v1))
+}
+
+%action new() {
+    %t "new"
+    $MESSAGE__NEW
+    {
+        new(v)  = !inH(v) & 1/2
+        $UPDATE__NEW
+    }
+}
+
+%action allocate(lhs, type) {
+    %t "allocate " + lhs + " : " + type
+    %f { new(v) $FOCUS__ALLOC }
+
+    /* infinite memory assumption */
+    %p (E(v) !new(v) & !inH(v)) & (E(v) new(v))
+
+    %message (E(v0) lhs(v0)) ->
+                 "In allocate: Assigning to non-NULL variable: " + lhs
+
+    $MESSAGE__ALLOC
+    {
+        lhs(v)            = new(v)
+        new(v)            = 0
+        inH(v)            = inH(v) | new(v)
+        type(v)           = type(v) | new(v)
+        step(v0, v1)      = step(v0, v1)
+        reachable(v0, v1) = reachable(v0, v1)
+
+        $UPDATE__ALLOC
+    }
+}
+
+#define LIVE(v) |/{ r[p](v) : p in Variables }
+
+%action free(lhs) {
+    %t "free " + lhs
+    %f { lhs(v) }
+    %message (E(v) lhs(v) & |/{ r[p](v) : p in Variables-{lhs} })
+                -> "In free: " + lhs + " has an alias"
+    $MESSAGE__FREE
+    {
+        foreach(t in Types) {
+            t(v) = (!lhs(v) ? t(v) : 1/2)
+        }
+        // lhs(v) = 0
+        inH(v) = inH(v) & !lhs(v)
+        $UPDATE__FREE
+    }
+}
+
+
+%action gc() {
+    %t "gc"
+    $MESSAGE__GC
+    {
+        foreach(t in Types) {
+            t(v) = (LIVE(v) ? t(v) : 1/2)
+        }
+        inH(v) = inH(v) & LIVE(v)
+        $UPDATE__GC
+    }
+}
+
+%action call(r) {
+    %t "call " + r
+    %message (ret[r]()) ->
+        "recursive call " + r
+    {
+        ret[r]() = 1
+    }
+}
+
+%action return(r) {
+    %t "return " + r
+    %p ret[r]()
+    %message (!ret[r]()) ->
+        "invalid return " + r
+    {
+        ret[r]() = 0
+    }
+}
+
+%action select(lhs, type) {
+    %t "select "+lhs+" of "+type
+    {
+        lhs(v) = type(v) & inH(v) & 1/2
+    }
+}
+
+%action focus(lhs) {
+    %t "focus " + lhs
+    %f { lhs(v) }
+}
+
+%action fail() {
+    %message (1) ->
+        "assertion failed"
+}
+EOF
+#}}}
+}
+
+case $SEMANTICS in
+    *)  default ;;
+esac

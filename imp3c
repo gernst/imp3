@@ -1,0 +1,918 @@
+#!/usr/bin/python
+# TODO: renaming!
+
+from imp3 import parse
+from sys import stdin, stderr, exit
+from optparse import OptionParser
+from fnmatch import fnmatch
+
+def strip_quotes(s):
+    if s.startswith('"') and s.endswith('"'):
+        return s[1:-1]
+    else:
+        return s
+
+def fnmatch_any(filename, patternli):
+    for pattern in patternli:
+        if fnmatch(filename, pattern):
+            return True
+    return False
+
+def isTuple(t):
+    return type(t) == type(())
+
+def allEqual(li, pred):
+    if len(li) == 0:
+        return True
+    else:
+        a = li[0]
+        for b in li:
+            if not pred(b,a):
+                return False
+        return True
+
+def uniq(seq):
+    seen = {}
+    result = []
+    for item in seq:
+        if item in seen: continue
+        seen[item] = 1
+        result.append(item)
+    return result
+
+class Generator:
+    def __init__(self, program, options):
+        self.program = program
+        self.options = options
+        self.transitions = []
+        self.main   = "main"
+        self.qentry = "entry"
+        self.qpre   = "pre"
+        self.qstart = "start"
+        self.qexit  = "exit"
+        self.qpost  = "post"
+        self.qfail  = "fail"
+        self.br     = [] # break label stack
+        self.ret    = [] # return label stack
+        self.vuse   = {}
+        self.q      = 0  # monotonic label counter
+        self.vars   = {} # Var -> Type
+        self.attrs  = {} # Var -> Attribute
+        self.is_array  = {}
+        self.fields    = {}
+        self.functions = {}
+        self.structs   = []
+        self.super     = {}
+        self.overrides = {}
+        self.otype     = None
+        self.current_token = []
+        self.call_stack = []
+        self.rsites = []
+        self.cfuncs = {}
+        self.init   = []
+        self.pre    = []
+        self.post   = []
+        self.datatypes = []
+        self.constrs   = {}
+        self.sels      = {}
+
+    def error(self, msg):
+        if len(self.current_token)>0:
+            msg = msg + ' caused by '+str(self.current_token[-1])
+        if len(self.call_stack)>0:
+            msg = msg + ' in function '+str(self.call_stack[-1])
+        exit('error: '+msg)
+
+    def new_state(self,q='q'):
+        if len(self.call_stack)>0:
+            n = self.call_stack[-1]
+        else:
+            n = q
+        self.q = self.q+1
+        return "%s%02d" % (n, self.q)
+
+    def field_name(self, sname, vname):
+        return '%s.%s' % (sname, vname)
+
+    def remove_not(self, token, test=True):
+        type = token[0]
+        if type == 'not':
+            return self.remove_not(token[1], not test)
+        elif type == 'false':
+            if test: return 'false',
+            else:    return 'true',
+        elif type == 'true':
+            if test: return 'true',
+            else:    return 'false',
+        elif type == 'null':
+            _, lhs = token
+            self.check_var(lhs)
+            if test: return 'is_null', lhs
+            else:    return 'is_not_null', lhs
+        elif type == 'unequal':
+            _, lhs, rhs = token
+            return self.remove_not(("equal", lhs, rhs,), not test)
+        elif type == 'equal':
+            _, lhs, rhs = token
+            self.check_var(lhs)
+            if rhs == 'null':
+                if test: return 'is_null', lhs
+                else:    return 'is_not_null', lhs
+            else:
+                self.check_var(rhs)
+                self.check_compatible(lhs, rhs)
+                if test: return 'is_equal', lhs, rhs
+                else:    return 'is_not_equal', lhs, rhs
+        elif type == 'marked':
+            _, lhs, pred = token
+            self.check_var(lhs)
+            if test: return 'is_marked', lhs, pred
+            else:    return 'is_not_marked', lhs, pred
+        elif type == 'rel':
+            _, lhs, pred, rhs = token
+            self.check_var(lhs)
+            self.check_var(rhs)
+            if test: return 'is_rel', lhs, pred, rhs
+            else:    return 'is_not_rel', lhs, pred, rhs
+        else:
+            self.error('unknown condition '+token)
+
+    def format_transition(self, token):
+        if token is None:
+            self.error('none token')
+
+        if not isTuple(token):
+             return token
+
+        action = token[0]
+        params = token[1:]
+        if self.otype is not None:
+            if self.otype in self.overrides:
+                if action in self.overrides[self.otype]:
+                    action = self.otype+'_'+action
+        return action+'('+', '.join(params)+')'
+
+    def add_datatypes(self, datas):
+        for data in datas:
+            _, name = data
+            if name in self.datatypes:
+                self.error("duplicate data type name: '"+name+"'")
+            self.datatypes.append(name)
+
+    def add_constrs(self, cases):
+        for case in cases:
+            _, name, type, sels = case
+            if name in self.constrs:
+                self.error("duplicate constructor name: '"+name+"'")
+            self.constrs[name] = type
+            self.add_sels(name, sels)
+
+    def add_sels(self, name, sels):
+        for sel in sels:
+            _, sname, type, _ = sel
+            self.check_sel_type(sname, type)
+            s = self.field_name(name, sname)
+            if s in self.sels:
+                self.error("duplicate selector name: '"+s+"'")
+            self.sels[s] = type
+
+    def add_functions(self, functions):
+        for fun in functions:
+            _, name, body = fun
+            self.add_function(name, body)
+
+    def add_function(self, name, body):
+        if name in self.functions:
+            self.error("duplicate function name: '"+name+"'")
+        self.functions[name] = body
+
+    def add_structs(self, structs):
+        for struct in structs:
+            _, name, _, super, overrides = struct
+            self.add_struct(name, super)
+            self.overrides[name] = [o[1] for o in overrides]
+
+        for struct in structs:
+            _, name, svars, _, _ = struct
+            self.add_struct_vars(name, svars)
+
+    def add_struct(self, name, super):
+        if name in self.structs:
+            self.error("duplicate struct name: '"+name+"'")
+        self.structs.append(name)
+        self.super[name] = super
+
+    def add_struct_vars(self, name, vars):
+        for var in vars:
+            _, vname, type, _ = var
+            type, is_array = self.is_array_type(type)
+            self.check_field_type(vname, type)
+            f = self.field_name(name, vname)
+            if f in self.fields:
+                self.error("duplicate field name: '"+f+"'")
+            self.fields[f] = type
+            self.is_array[f] = is_array
+
+    def add_vars(self, vars):
+        for var in vars:
+            _, name, type, attrs = var
+            self.add_var(name, type, attrs)
+
+    def add_var(self, name, type, attrs):
+        type, is_array = self.is_array_type(type)
+        self.check_type(name, type)
+
+        if name in self.vars:
+            if not self.vars[name] == type:
+                self.error("duplicate variable: '"+name+"' already defined with type '"+type+"'")
+        else:
+            self.vars[name] = type
+            self.attrs[name] = attrs
+            self.is_array[name] = is_array
+
+    def is_array_type(self, type):
+        if type.endswith("[]"):
+            return type[:-2], True
+        else:
+            return type, False
+
+    def check_function(self, fun):
+        if fun not in self.functions:
+            self.error("unknown function: '"+fun+"'")
+
+    def check_var(self, var):
+        if var not in self.vars:
+            self.error("unknown variable: '"+var+"'")
+
+    def check_field(self, f):
+        if f not in self.fields:
+            self.error("unknown field: '"+f+"'")
+
+    def check_type(self, vname, type):
+        if type not in self.structs:
+            self.error("unknown type '"+type+"' of variable '"+vname+"'")
+
+    def check_field_type(self, vname, type):
+        if type not in self.structs:
+            self.error("unknown type '"+type+"' of field '"+vname+"'")
+
+    def check_sel_type(self, vname, type):
+        if type not in self.structs and type not in self.datatypes:
+            self.error("unknown type '"+type+"' of selector '"+vname+"'")
+
+    def lookup_field(self, var, f):
+        type = self.vars[var]
+        while True:
+            f1 = self.field_name(type, f)
+            if f1 in self.fields:
+                return f1
+            elif type in self.super:
+                type = self.super[type]
+            else:
+                return ''
+
+    def lookup_type(self, type):
+        return type
+
+    def check_subtype(self, type0, type1):
+        if type0 == type1:
+            return True
+        if type1 not in self.super:
+            return False
+        return self.check_subtype(type0, self.super[type1])
+
+    def check_compatible(self, var0, var1):
+        # TODO: array handling
+        if not self.check_subtype(self.vars[var0], self.vars[var1]):
+            self.error("incompatible types of '%s: %s' and '%s: %s'" % (var0, self.vars[var0], var1, self.vars[var1]))
+
+    def check_compatible_field(self, var, f, forward=True):
+        if forward:
+            lhs = self.vars[var]
+            rhs = self.fields[f]
+        else:
+            lhs = self.fields[f]
+            rhs = self.vars[var]
+
+        if not self.check_subtype(lhs, rhs):
+            self.error("incompatible types of '%s: %s' and '%s: %s'" % (var, self.vars[var], f, self.fields[f]))
+
+    def check_compatible_type(self, var, type):
+        if not self.check_subtype(self.vars[var], type):
+            self.error("incompatible types of '%s: %s' and '%s'" % (var, self.vars[var], type))
+        
+    def compile_main(self):
+        initcalls = [('call', i) for i in self.init]
+        self.compile_block(initcalls, self.qentry, self.qpre)
+        self.add_transition(self.qpre,  ('precondition',), self.qstart)
+        self.compile_function(self.main, self.qstart, self.qpost)
+        self.add_transition(self.qpost, ('postcondition',), self.qexit)
+
+    def compile_function(self, name, q0, q1):
+        if name in self.call_stack:
+            self.error("recursive call to '%s'" % (name))
+        self.call_stack.append(name)
+        self.ret.append(q1)
+        self.compile_block(self.functions[name], q0, q1)
+        self.ret.pop()
+        self.call_stack.pop()
+
+    def call_function(self, name, q0, q1):
+        if name in self.call_stack:
+            self.error("recursive call to '%s'" % (name))
+        self.call_stack.append(name)
+        self.ret.append(q1)
+        
+        if name not in self.cfuncs:
+            qf0 = self.new_state()
+            qf1 = self.new_state()
+            self.compile_block(self.functions[name], qf0, qf1)
+            self.cfuncs[name] = (qf0, qf1)
+        else:
+            qf0, qf1 = self.cfuncs[name]
+
+        callid = self.new_state()
+
+        self.add_transition(q0,  ('call', callid),   qf0)
+        self.add_transition(qf1, ('return', callid), q1)
+
+        self.rsites.append(callid)
+
+        self.ret.pop()
+        self.call_stack.pop()
+
+
+    def compile_block(self, body, q0, q1):
+        i = 0
+        n = len(body)
+        for token in body:
+            i = i+1
+            if i<n: q = self.new_state()
+            else:   q = q1
+            self.compile_statement(token, q0, q)
+            q0 = q
+
+    def add_transition(self, q0, token, q1):
+        self.transitions.append((q0, token, q1))
+
+    def remove_transition(self, q0, token, q1):
+        self.transitions.remove((q0, token, q1))
+
+    def compile_statement(self, token, q0, q1):
+        self.current_token.append(token)
+
+        if token is None:
+            self.error('none token')
+
+        type = token[0]
+
+        if type == 'skip':
+            self.add_transition(q0, token, q1)
+
+        elif type == 'allocate':
+            _, lhs = token
+            self.check_var(lhs)
+            self.otype = self.vars[lhs]
+            q2 = self.new_state()
+            self.add_transition(q0, ('new',), q2)
+            self.add_transition(q2, (type, lhs, self.lookup_type(self.otype)), q1)
+
+        elif type == 'focus':
+            _, lhs = token
+            if lhs in self.structs:
+                self.add_transition(q0, ('focus', self.lookup_type(lhs)), q1)
+            else:
+                self.check_var(lhs)
+                self.add_transition(q0, token, q1)
+
+        elif type == 'select':
+            _, lhs, type = token
+            self.check_var(lhs)
+            self.check_compatible_type(lhs, type)
+            self.add_transition(q0, ('select', lhs, self.lookup_type(type)), q1)
+
+        elif type in ['free', 'dispose']:
+            _, lhs = token
+            self.check_var(lhs)
+            self.otype = self.vars[lhs]
+            self.add_transition(q0, token, q1)
+
+        elif type == 'gc':
+            self.add_transition(q0, token, q1)
+
+        elif type == 'assign':
+            _, lhs, tyrhs = token
+            rhs, ty = tyrhs
+            _, lvar, lsel = lhs
+            _, rvar, rsel = rhs
+
+            if lsel is not None and rsel is not None:
+                self.error('statement of the form x.s = y.t is unsupported')
+
+            if ty is not None and (lsel is not None or rsel is not None):
+                self.error('cast can only be applied to simple rhs')
+
+            if rvar is None and lsel is not None:
+                self.compile_statement(("clear_field", lvar, lsel,), q0, q1)
+            elif rvar is None:
+                self.compile_statement(("clear", lvar,), q0, q1)
+            elif lsel is not None:
+                self.compile_statement(("set_field", lvar, lsel, rvar,), q0, q1)
+            elif rsel is not None:
+                self.compile_statement(("get_field", lvar, rvar, rsel,), q0, q1)
+            elif ty is not None:
+                self.compile_statement(("copy_as", lvar, rvar, ty,), q0, q1)
+            else:
+                self.compile_statement(("copy", lvar, rvar,), q0, q1)
+
+        elif type == 'clear':
+            _, lhs = token
+            self.check_var(lhs)
+            self.add_transition(q0, token, q1)
+
+        elif type == 'copy':
+            _, lhs, rhs = token
+            self.check_var(lhs)
+            self.check_var(rhs)
+            self.check_compatible(lhs, rhs)
+            # q2 = self.new_state()
+            # self.add_transition(q0, ("clear", lhs), q2)
+            # self.add_transition(q2, token, q1)
+            self.add_transition(q0, token, q1)
+
+        elif type == 'copy_as':
+            _, lhs, rhs, type = token
+            self.check_var(lhs)
+            self.check_var(rhs)
+            self.check_compatible_type(lhs, type)
+            # self.check_compatible_type(rhs, type)
+            # q2 = self.new_state()
+            # self.add_transition(q0, ("clear", lhs), q2)
+            # self.add_transition(q2, ('copy_as', lhs, rhs, 'is'+type), q1)
+            self.add_transition(q0, ('copy_as', lhs, rhs, self.lookup_type(type)), q1)
+
+
+        elif type == 'clear_field':
+            _, lhs, f0 = token
+            self.check_var(lhs)
+            f1 = self.lookup_field(lhs, f0)
+            self.check_field(f1)
+            self.otype = self.vars[lhs]
+            self.add_transition(q0, ("clear_field_null", lhs, f1), q1)
+            self.add_transition(q0, ("clear_field_nonnull", lhs, f1), q1)
+
+        elif type == 'get_field':
+            _, lhs, rhs, f0 = token
+            self.check_var(lhs)
+            self.check_var(rhs)
+            f1 = self.lookup_field(rhs, f0)
+            self.check_field(f1)
+            self.check_compatible_field(lhs, f1)
+            self.otype = self.vars[rhs]
+            # q2 = self.new_state()
+            # self.add_transition(q0, ("clear", lhs), q2)
+            # self.add_transition(q2, (type, lhs, rhs, f1), q1)
+            self.add_transition(q0, (type, lhs, rhs, f1), q1)
+
+        elif type == 'set_field':
+            _, lhs, f0, rhs = token
+            self.check_var(lhs)
+            f1 = self.lookup_field(lhs, f0)
+            self.check_field(f1)
+            self.check_var(rhs)
+            self.check_compatible_field(rhs, f1, False)
+            self.otype = self.vars[lhs]
+            q2 = self.new_state()
+            self.add_transition(q0, ("clear_field_null", lhs, f1), q2)
+            self.add_transition(q0, ("clear_field_nonnull", lhs, f1), q2)
+            self.add_transition(q2, ('set_field_null', lhs, f1, rhs), q1)
+            self.add_transition(q2, ('set_field_nonnull', lhs, f1, rhs), q1)
+            # self.add_transition(q0, (type, lhs, f1, rhs), q1)
+
+        elif type == 'if':
+            _, condition, true_branch, false_branch = token
+
+            qt = self.new_state()
+            self.add_transition(q0, self.remove_not(condition), qt)
+            self.compile_block(true_branch, qt, q1)
+
+            if len(false_branch)>0:
+                qf = self.new_state()
+                self.add_transition(q0, self.remove_not(condition, False), qf)
+                self.compile_block(false_branch, qf, q1)
+            else:
+                self.add_transition(q0, self.remove_not(condition, False), q1)
+
+        elif type == 'while':
+            _, condition, body = token
+            qt = self.new_state()
+            self.add_transition(q0, self.remove_not(condition), qt)
+            self.add_transition(q0, self.remove_not(condition, False), q1)
+            self.br.append(q1)
+            self.compile_block(body, qt, q0)
+            self.br.pop()
+
+        elif type == 'break':
+            self.add_transition(q0, ('skip',), self.br[-1])
+
+        elif type == 'goto':
+            loc = token[1]
+            self.add_transition(q0, ('skip',), strip_quotes(loc))
+
+        elif type == 'return':
+            self.add_transition(q0, ('skip',), self.ret[-1])
+
+        elif type == 'exit':
+            self.add_transition(q0, ('skip',), self.qpost)
+
+        elif type in 'assert':
+            condition = token[1]
+            self.add_transition(q0, self.remove_not(condition), q1)
+            self.add_transition(q0, self.remove_not(condition, False), self.qfail)
+
+        elif type == 'assume':
+            condition = token[1]
+            self.add_transition(q0, self.remove_not(condition), q1)
+
+        elif type == 'choice':
+            _, choices = token
+            for body in choices:
+                self.compile_block(body, q0, q1)
+
+        elif type == 'do':
+            _, code = token
+            self.add_transition(q0, strip_quotes(code), q1)
+
+        elif type in ['mark', 'unmark']:
+            lhs = token[1]
+            self.check_var(lhs)
+            self.add_transition(q0, token, q1)
+
+        elif type == 'call':
+            name = token[1]
+            self.check_function(name)
+            if self.options.inline:
+                self.compile_function(name, q0, q1)
+            else:
+                self.call_function(name, q0, q1)
+
+        elif type == 'inline_call':
+            name = token[1]
+            self.check_function(name)
+            self.compile_function(name, q0, q1)
+
+        elif type == '%':
+            tr = token[2]
+            tr[0:0] = token[1],
+            self.add_transition(q0, tuple(tr), q1)
+
+        else:
+            self.error('unknown token')
+
+        self.current_token.pop()
+        self.otype = None
+
+    def successors(self, q):
+        return [t for t in self.transitions if t[0] == q]
+
+    def predecessors(self, q):
+        return [t for t in self.transitions if t[2] == q]
+
+    def descendants(self, q0):
+        visited = []
+        todo    = [q0]
+
+        while len(todo) > 0:
+            q = todo.pop()
+            if not q in visited:
+                visited.append(q)
+                todo.extend([t[2] for t in self.successors(q)])
+
+        return visited
+
+    def uses(self, tr, var):
+        a = tr[1]
+        type = a[0]
+
+        if '@output' in self.attrs[var] and tr[2] in [self.qexit]:
+            return True
+
+        if type in ['mark', 'unmark', 'clear_field', 'clear_field_null', 'clear_field_nonnull', 'free', 'dispose', 'focus', 'assert'] and a[1] == var:
+            return True
+        elif type in ['copy', 'copy_as', 'get_field'] and a[2] == var:
+            return True
+        elif type in ['set_field', 'set_field_null', 'set_field_nonnull'] and (a[1] == var or a[3] == var):
+            return True
+        if type in ['is_equal', 'is_not_equal'] and (a[1] == var or a[2] == var):
+            return True
+        if type in ['is_rel', 'is_not_rel'] and (a[1] == var or a[3] == var):
+            return True
+        elif type in ['is_marked', 'is_not_marked', 'is_null', 'is_not_null'] and a[1] == var:
+            return True
+        else:
+            return False
+
+    def defines(self, tr, var):
+        a = tr[1]
+        type = a[0]
+
+        if '@input' in self.attrs[var] and tr[0] == self.qentry:
+            return True
+
+        if type in ['allocate'] and a[1] == var:
+            return True
+        elif type in ['copy', 'copy_as', 'get_field', 'mark', 'unmark', 'select'] and a[1] == var:
+            return True
+        else:
+            return False
+
+    def mark_liveness(self, var):
+        visited = []
+        todo    = [t for t in self.transitions if self.uses(t, var)]
+
+        if self.options.debug:
+            print(var,'is used at',sorted([tr[0] for tr in todo]))
+        
+        while len(todo) > 0:
+            tr = todo.pop()
+            if not tr in visited:
+                visited.append(tr)
+                q0, a, q1 = tr
+                preds = [t for t in self.predecessors(q0) if not self.defines(t, var)]
+                todo.extend(preds)
+
+        self.vuse[var] = visited
+
+        if self.options.debug:
+            print(var,'is alive at',sorted([tr[0] for tr in visited]))
+
+    def clear_at_first_dead(self, var):
+        visited = []
+        todo    = []
+        for tr in self.transitions:
+            if self.defines(tr, var):
+                todo.extend(self.successors(tr[2]))
+
+        if self.options.debug:
+             print(var,'is defined at',sorted([tr[0] for tr in todo]))
+
+        while len(todo) > 0:
+            tr = todo.pop()
+            if not tr in visited:
+                visited.append(tr)
+                q0, a, q1 = tr
+                if var not in self.vuse or tr not in self.vuse[var]:
+                    if not a == ('clear', var):
+                        q2 = self.new_state()
+                        self.remove_transition(q0, a, q1)
+                        self.add_transition(q0, ('clear', var), q2)
+                        self.add_transition(q2, a, q1)
+                else:
+                    todo.extend([t for t in self.successors(q1)])
+
+    def insert_clears(self):
+        if self.options.clear:
+            vs = self.vars.keys()
+            for v in vs:
+                self.mark_liveness(v)
+                self.clear_at_first_dead(v)
+
+    def remove_unreachables(self):
+        if self.options.cut:
+            keep = self.descendants(self.qentry)
+            print('reachable states',keep)
+            self.transitions = [t for t in self.transitions if t[0] in keep]
+
+    def cmp_transitions(self, tr0, tr1):
+        if tr0[0] == tr1[0]:
+            return 0
+        elif tr0[0] == self.qentry:
+            return -1
+        elif tr1[0] == self.qentry:
+            return  1
+        elif tr0[0] == self.qstart:
+            return -1
+        elif tr1[0] == self.qstart:
+            return  1
+        elif tr0[0] == self.qexit:
+            return  1
+        elif tr1[0] == self.qexit:
+            return -1
+        elif tr0[0] == self.qpost:
+            return  1
+        elif tr1[0] == self.qpost:
+            return -1
+        else:
+            return cmp(tr0[0], tr1[0])
+
+    def sort_transitions(self):
+        self.transitions.sort(cmp=self.cmp_transitions)
+        pass
+
+    def write_sets(self):
+        s = open(self.program+'_sets.tvp', 'w')
+        print('%s Fields {'+', '.join(self.fields.keys())+'}', file=s)
+        print('%s Arrays {'+', '.join([n for n in self.is_array if self.is_array[n]])+'}', file=s)
+        print('%s Variables {'+', '.join(self.vars.keys())+'}', file=s)
+        print('%s Selectors {'+', '.join(self.sels.keys())+'}', file=s)
+        print('%s Types {'+', '.join([self.lookup_type(n) for n in self.structs])+'}', file=s)
+        print('%s Data  {'+', '.join([self.lookup_type(n) for n in self.datatypes])+'}', file=s)
+        print('%s Constructors  {'+', '.join([n for n in self.constrs.keys()])+'}', file=s)
+        print('%s ReturnSites {'+', '.join([n for n in self.rsites])+'}', file=s)
+
+        for struct in self.structs:
+            fields = [n for n in self.fields if n.startswith(struct+'.')] # kludge. use better datastructures
+            print('%s '+struct+'Fields {'+', '.join(fields)+'}', file=s)
+
+        for struct in self.structs:
+            vars = [n for n in self.vars.keys() if self.check_subtype(struct, self.vars[n])]
+            print('%s '+struct+'Vars {'+', '.join(vars)+'}', file=s)
+        s.close()
+
+    def write_types(self):
+        t = open(self.program+'_types.tvp', 'w')
+        for t1 in self.structs:
+            for t2 in self.structs:
+                if self.check_subtype(t1, t2):
+                    if not t1 == t2:
+                        print('%r',t2+'(v) ==> '+t1+'(v)', file=t)
+                elif not self.check_subtype(t2, t1):
+                    print('%r',t1+'(v) ==> !'+t2+'(v)', file=t)
+                    # print('%r',t2+'(v) ==> !'+t1+'(v)' # redundant, file=t)
+            for f in self.fields:
+                if f.startswith(t1+'.'):
+                    print('%r E(v1)',f+'(v0,v1) ==>',t1+'(v0)', file=t)
+                    print('%r E(v0)',f+'(v0,v1) ==>',self.fields[f]+'(v1)', file=t)
+                    print('%r','!'+t1+'(v0) ==>','!'+f+'(v0,v1)', file=t)
+                    print('%r','!'+self.fields[f]+'(v1) ==>','!'+f+'(v0,v1)', file=t)
+
+        for t1 in self.constrs:
+            t2 = self.constrs[t1]
+            print('%r',t1+'(v) ==> '+t2+'(v)', file=t)
+            sels = [s for s in self.sels if s.startswith(t1+'.')]
+            if len(sels)>0:
+                print('%r',t1+'(v0) & '+t1+'(v1) & &/{ E(v2) f(v0, v2) & f(v1, v2) : f in {'+','.join(sels)+'}} ==> v0 == v1', file=t)
+            else:
+                print('%r',t1+'(v0) & '+t1+'(v1) ==> v0 == v1', file=t)
+
+            for s in sels:
+                print('%r E(v1)',s+'(v0,v1) ==>',t1+'(v0)', file=t)
+                print('%r E(v0)',s+'(v0,v1) ==>',self.sels[s]+'(v1)', file=t)
+                print('%r','!'+t1+'(v0) ==>','!'+s+'(v0,v1)', file=t)
+                print('%r','!'+self.sels[s]+'(v1) ==>','!'+s+'(v0,v1)', file=t)
+
+            for t2 in self.constrs:
+                if not t1 == t2:
+                    print('%r',t1+'(v) ==> !'+t2+'(v)', file=t)
+
+        for v in self.vars:
+            t1 = self.vars[v]
+            print('%r',v+'(v) ==> '+t1+'(v)', file=t)
+        t.close()
+
+    def write_program(self, show):
+        self.options.predicates[0:0] = [self.program+'_sets', 'predicates0', self.program+'_types']
+        self.options.actions[0:0]    = ['actions0' ]
+
+        tvp  = open(self.program + '.tvp',  'w')
+        for predicate in self.options.predicates: print('#include "'+predicate+'.tvp"', file=tvp)
+        print('%%', file=tvp)
+        for action    in self.options.actions:    print('#include "'+action+'.tvp"', file=tvp)
+        print('%action precondition() {', file=tvp)
+        print('    %t "precondition"', file=tvp)
+        for pre in self.pre:
+            name, form = pre
+            print('    %message (!(',strip_quotes(form),'))', file=tvp)
+            print('        -> "precondition',name,'failed\\n"', file=tvp)
+        print('}', file=tvp)
+        print('%action postcondition() {', file=tvp)
+        print('    %t "postcondition"', file=tvp)
+        for post in self.post:
+            name, form = post
+            print('    %message (!(',strip_quotes(form),'))', file=tvp)
+            print('        -> "postcondition',name,'failed\\n"', file=tvp)
+        print('}', file=tvp)
+        print('%%', file=tvp)
+        
+        # if len([tr for tr in self.transitions if tr[2] == self.qfail])>0:
+        #     self.add_transition(self.qfail, ('fail',), self.qexit)
+
+        for line in self.transitions:
+            q0, tr, q1 = line
+            print(q0, self.format_transition(tr), q1, file=tvp)
+
+        if show is not None:
+            print('%%', ', '.join([strip_quotes(s) for s in show]), file=tvp)
+
+        tvp.close()
+
+
+def parse_file(name, type='program'):
+    imp3 = open(name + '.imp3', 'r')
+    ast  = parse(type, imp3.read())
+    imp3.close()
+    return ast
+
+def main():
+    parser = OptionParser("usage: %prog [options] <program>")
+
+    parser.add_option("-c", "--cut",        dest="cut",        action="store_true")
+    parser.add_option("-Z", "--no-clear",   dest="clear",      default=True, action="store_false")
+    parser.add_option("-d", "--debug",      dest="debug",      action="store_true")
+    parser.add_option("-i", "--inline",     dest="inline",     action="store_true")
+    parser.add_option("-n", "--noinline",   dest="inline",     action="store_false")
+    parser.add_option("-M", "--import",     dest="imports",    default=[], action="append")
+    parser.add_option("-P", "--predicates", dest="predicates", default=[], action="append")
+    parser.add_option("-A", "--actions",    dest="actions",    default=[], action="append")
+    parser.add_option("-C", "--contracts",  dest="contracts",  default=[], action="append")
+
+    (options, args) = parser.parse_args()
+
+    if len(args)>0:
+        program = args[0]
+
+        ast = parse_file(program)
+
+        g = Generator(program, options)
+
+        if g.options.debug:
+             print(ast)
+
+        _, name, includes, structs, vars, functions, main, show = ast
+        imports, predicates, actions, contracts = includes
+
+        g.options.imports.extend(imports)
+        g.options.predicates.extend(predicates)
+        g.options.actions.extend(actions)
+        g.options.contracts.extend(contracts)
+
+        g.options.imports    = uniq(g.options.imports)
+        g.options.predicates = uniq(g.options.predicates)
+        g.options.actions    = uniq(g.options.actions)
+        g.options.contracts  = uniq(g.options.contracts)
+
+        if not name == program:
+            print("warning: program name",name,"does not match")
+
+        if g.options.debug:
+            print("imports",    g.options.imports)
+            print("predicates", g.options.predicates)
+            print("actions",    g.options.actions)
+            print("contracts",  g.options.contracts)
+
+        for im in g.options.imports:
+            ast = parse_file(im, 'signature')
+            if g.options.debug:
+                print(ast)
+
+            _, im_name, im_structs, im_vars, im_functions = ast
+            g.add_structs  (filter(lambda s: s[0] == 'struct', im_structs))
+            g.add_datatypes(filter(lambda s: s[0] == 'data',   im_structs))
+            g.add_constrs  (filter(lambda s: s[0] == 'case',   im_structs))
+            g.add_vars(im_vars)
+            g.add_functions(im_functions)
+
+        for con in g.options.contracts:
+            ast = parse_file(con, 'contracts')
+            if g.options.debug:
+                print(ast)
+
+            _, con_ditions, con_tracts, con_vars, con_functions = ast
+            g.add_vars(con_vars)
+            g.add_functions(con_functions)
+
+            conds    = { c[1] : c[2] for c in con_ditions }
+            relevant = [ c for c in con_tracts if fnmatch_any(program, c[1])]
+            for r in relevant:
+                _, _, init, pre, post = r
+                # TODO: error handling
+                g.init.extend(init)
+                g.pre.extend([(p,  conds[p]) for p in pre])
+                g.post.extend([(p, conds[p]) for p in post])
+
+            if g.options.debug:
+                print("preconditions",  g.pre)
+                print("postconditions", g.post)
+
+        g.add_structs  (filter(lambda s: s[0] == 'struct', structs))
+        g.add_datatypes(filter(lambda s: s[0] == 'data',   structs))
+        g.add_constrs  (filter(lambda s: s[0] == 'case',   structs))
+        g.add_vars(vars)
+        g.add_function("main", main)
+        g.add_functions(functions)
+
+        g.compile_main()
+
+        g.insert_clears()
+        g.remove_unreachables()
+        g.sort_transitions()
+
+        g.write_sets()
+        g.write_types()
+        g.write_program(show)
+
+    else:
+        parser.print_help()
+
+if __name__ == '__main__':
+    main()
