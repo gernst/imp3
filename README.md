@@ -21,9 +21,8 @@ Dependencies
 
 -   python-setuptools
 
--   yapps 2.* <http://theory.stanford.edu/~amitp/yapps/>
-
-    easy_install yapps
+-   yapps 2.* <http://theory.stanford.edu/~amitp/yapps/>  
+    `easy_install yapps`
 
 Installation
 ------------
